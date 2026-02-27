@@ -1,0 +1,214 @@
+“””
+vt_critic_simulation.py — Critic Agent Reference Implementation
+
+Accompanies: “Adaptive Reasoning Orchestration: A Variability Theory Engine
+for Real-Time Stagnation Detection, Adaptive Escalation, and Field Transformation”
+Author: Julia Ryzhkova (2026)
+
+Validates the Cognitive Entropy Index (Equation 4) and threshold-driven
+escalation rules (Equations 5-6) on three synthetic scenarios in 768-dimensional
+embedding space. See Section 3 of the paper.
+
+Requirements: numpy, matplotlib, scikit-learn
+Seed: 42 (deterministic reproduction)
+
+Usage: python vt_critic_simulation.py
+Outputs: vt_critic_simulation.png (Figure 1), console Table 1
+“””
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+SEED = 42
+DIM = 768
+STEPS = 120
+T = 10
+K = 5
+THRESHOLDS = [0.55, 0.70, 0.82, 0.92]
+
+np.random.seed(SEED)
+
+def compute_inertia(vectors, window_size=T):
+“””
+Cognitive Entropy Index (Equation 4):
+I_t = 1 - (1/T) * sum(d(h_i, h_bar)) / d_max
+
+```
+d_max is the maximum cosine distance observed across the entire
+trajectory (global normalization).
+"""
+all_distances = []
+for t in range(len(vectors)):
+    start = max(0, t - window_size + 1)
+    window = vectors[start:t + 1]
+    if len(window) < 2:
+        continue
+    centroid = np.mean(window, axis=0)
+    for v in window:
+        nv, nc = np.linalg.norm(v), np.linalg.norm(centroid)
+        if nv > 0 and nc > 0:
+            cs = np.clip(np.dot(v, centroid) / (nv * nc), -1.0, 1.0)
+            all_distances.append(1.0 - cs)
+d_max = max(all_distances) if all_distances else 1.0
+
+inertia = np.zeros(len(vectors))
+for t in range(len(vectors)):
+    start = max(0, t - window_size + 1)
+    window = vectors[start:t + 1]
+    if len(window) < 2:
+        inertia[t] = 0.0
+        continue
+    centroid = np.mean(window, axis=0)
+    distances = []
+    for v in window:
+        nv, nc = np.linalg.norm(v), np.linalg.norm(centroid)
+        if nv > 0 and nc > 0:
+            cs = np.clip(np.dot(v, centroid) / (nv * nc), -1.0, 1.0)
+            distances.append(1.0 - cs)
+        else:
+            distances.append(0.0)
+    inertia[t] = 1.0 - (np.mean(distances) / d_max)
+return inertia
+```
+
+def compute_escalation(inertia_series, thresholds=THRESHOLDS, k=K):
+“”“Equations 5-6: threshold-driven level transitions.”””
+levels = np.zeros(len(inertia_series), dtype=int)
+current_level = 0
+escalation_points = []
+for t in range(len(inertia_series)):
+if t >= k and current_level < len(thresholds):
+if all(inertia_series[t - j] > thresholds[current_level] for j in range(k)):
+current_level += 1
+escalation_points.append(t)
+levels[t] = current_level
+return levels, escalation_points
+
+# === Scenario Generation ===
+
+def generate_scenario_a():
+“”“Progressive Stagnation. sigma = 1.5 * exp(-0.04t).”””
+attractor = np.random.randn(DIM)
+vectors = np.zeros((STEPS, DIM))
+for t in range(STEPS):
+vectors[t] = attractor + np.random.randn(DIM) * 1.5 * np.exp(-0.04 * t)
+return vectors
+
+def generate_scenario_b():
+“”“Adaptive Escalation. 3 phases, shifts at steps 38 and 75, Delta=8.0.”””
+a1 = np.random.randn(DIM)
+d2 = np.random.randn(DIM); d2 = d2 / np.linalg.norm(d2) * 8.0
+a2 = a1 + d2
+d3 = np.random.randn(DIM); d3 = d3 / np.linalg.norm(d3) * 8.0
+a3 = a2 + d3
+vectors = np.zeros((STEPS, DIM))
+for t in range(STEPS):
+if t < 38:
+center, pt = a1, t
+elif t < 75:
+center, pt = a2, t - 38
+else:
+center, pt = a3, t - 75
+vectors[t] = center + np.random.randn(DIM) * 1.2 * np.exp(-0.06 * pt)
+return vectors
+
+def generate_scenario_c():
+“”“Sustained Exploration. Sinusoidal drift, consistent noise sigma=2.0.”””
+base = np.random.randn(DIM)
+drift_dir = np.random.randn(DIM); drift_dir = drift_dir / np.linalg.norm(drift_dir)
+vectors = np.zeros((STEPS, DIM))
+for t in range(STEPS):
+drift = drift_dir * 6.0 * np.sin(2 * np.pi * t / 60)
+vectors[t] = base + drift + np.random.randn(DIM) * 2.0
+return vectors
+
+# === Run ===
+
+scenarios = {
+‘A’: (‘Progressive Stagnation’, generate_scenario_a()),
+‘B’: (‘Adaptive Escalation (VT)’, generate_scenario_b()),
+‘C’: (‘Sustained Exploration’, generate_scenario_c()),
+}
+
+results = {}
+for key, (desc, vectors) in scenarios.items():
+inertia = compute_inertia(vectors)
+levels, esc_pts = compute_escalation(inertia)
+pca = PCA(n_components=2)
+projected = pca.fit_transform(vectors)
+results[key] = dict(desc=desc, vectors=vectors, inertia=inertia,
+levels=levels, escalation_points=esc_pts, pca=projected)
+
+# === Table 1 ===
+
+print(”=” * 75)
+print(“Table 1. Critic agent simulation results.”)
+print(”=” * 75)
+print(f”{‘Metric’:<30} {‘Scenario A’:>12} {‘Scenario B’:>12} {‘Scenario C’:>12}”)
+print(”-” * 75)
+
+ra, rb, rc = results[‘A’], results[‘B’], results[‘C’]
+rows = [
+(“Mean I_t”, f”{np.mean(ra[‘inertia’]):.3f}”, f”{np.mean(rb[‘inertia’]):.3f}”, f”{np.mean(rc[‘inertia’]):.3f}”),
+(“Max I_t”, f”{np.max(ra[‘inertia’]):.3f}”, f”{np.max(rb[‘inertia’]):.3f}”, f”{np.max(rc[‘inertia’]):.3f}”),
+(“Final level”, f”L{ra[‘levels’][-1]}”, f”L{rb[‘levels’][-1]}”, f”L{rc[‘levels’][-1]}”),
+(“First escalation step”,
+str(ra[‘escalation_points’][0]) if ra[‘escalation_points’] else “None”,
+str(rb[‘escalation_points’][0]) if rb[‘escalation_points’] else “None”,
+str(rc[‘escalation_points’][0]) if rc[‘escalation_points’] else “None”),
+(“I_t drop after shift”, “None”, f”{np.min(rb[‘inertia’][75:85]):.2f}”, “N/A”),
+]
+for name, a, b, c in rows:
+print(f”{name:<30} {a:>12} {b:>12} {c:>12}”)
+print(”=” * 75)
+
+# === Figure 1 ===
+
+fig, axes = plt.subplots(3, 3, figsize=(16, 12))
+fig.suptitle(‘Figure 1. Critic Agent Simulation — Variability Theory Engine’,
+fontsize=14, fontweight=‘bold’, y=0.98)
+cmap = {‘A’: ‘#D32F2F’, ‘B’: ‘#1976D2’, ‘C’: ‘#388E3C’}
+
+for col, key in enumerate([‘A’, ‘B’, ‘C’]):
+r = results[key]
+color = cmap[key]
+
+```
+ax = axes[0, col]
+ax.plot(r['inertia'], color=color, linewidth=1.5)
+for i, th in enumerate(THRESHOLDS):
+    ax.axhline(y=th, color='gray', linestyle='--', alpha=0.5, linewidth=0.8)
+    ax.text(STEPS + 1, th, f'th{i}={th}', fontsize=7, va='center', color='gray')
+for ep in r['escalation_points']:
+    ax.axvline(x=ep, color='orange', alpha=0.5, linewidth=1)
+ax.set_title(f"Scenario {key} — {r['desc']}", fontsize=10, fontweight='bold')
+if col == 0: ax.set_ylabel('Cognitive Entropy Index (I_t)')
+ax.set_ylim(-0.05, 1.1); ax.set_xlim(0, STEPS); ax.grid(True, alpha=0.3)
+
+ax = axes[1, col]
+ax.step(range(STEPS), r['levels'], color=color, linewidth=2, where='post')
+for ep in r['escalation_points']:
+    ax.plot(ep, r['levels'][ep], 'o', color='orange', markersize=8, zorder=5)
+if col == 0: ax.set_ylabel('Escalation Level')
+ax.set_ylim(-0.3, 4.5); ax.set_yticks([0,1,2,3,4])
+ax.set_yticklabels(['L0','L1','L2','L3','L4']); ax.set_xlim(0, STEPS); ax.grid(True, alpha=0.3)
+
+ax = axes[2, col]
+p = r['pca']
+grad = plt.cm.RdYlGn_r(np.linspace(0, 1, STEPS))
+ax.scatter(p[:, 0], p[:, 1], c=grad, s=15, alpha=0.7)
+ax.scatter(p[0, 0], p[0, 1], c='green', s=100, marker='o', edgecolors='black', linewidth=1.5, zorder=10, label='Start')
+ax.scatter(p[-1, 0], p[-1, 1], c='red', s=100, marker='o', edgecolors='black', linewidth=1.5, zorder=10, label='End')
+for ep in r['escalation_points']:
+    ax.scatter(p[ep, 0], p[ep, 1], c='orange', s=120, marker='D', edgecolors='black', linewidth=1.5, zorder=10)
+ax.set_xlabel('PC1')
+if col == 0: ax.set_ylabel('PC2')
+ax.legend(fontsize=7, loc='upper right'); ax.grid(True, alpha=0.3)
+```
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig(‘vt_critic_simulation.png’, dpi=300, bbox_inches=‘tight’)
+plt.close()
+print(f”\nFigure saved: vt_critic_simulation.png”)
+print(“Simulation complete.”)
