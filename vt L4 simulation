@@ -1,0 +1,302 @@
+“””
+vt_L4_simulation.py — L4 Field Transformation Simulation
+
+Accompanies: “Adaptive Reasoning Orchestration: A Variability Theory Engine
+for Real-Time Stagnation Detection, Adaptive Escalation, and Field Transformation”
+Author: Julia Ryzhkova (2026)
+
+Tests whether write access (Equation 8) improves performance, and whether
+drift prevention safeguards are necessary. See Section 4 of the paper.
+
+Requirements: numpy, matplotlib
+Parameters: dim=128, tasks=200, types=8, max_steps=50, m=3, delta_nov=0.3,
+prune_N=30, prune_P=25
+Seed: 42 (deterministic reproduction)
+
+Usage: python vt_L4_simulation.py
+Outputs: vt_L4_simulation.png (Figure 2), console Table 2
+“””
+
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+SEED = 42
+DIM = 128
+N_TASKS = 200
+N_TYPES = 8
+MAX_STEPS = 50
+M_VALIDATE = 3
+DELTA_NOV = 0.3
+PRUNE_N = 30
+PRUNE_P = 25
+BLOAT_THRESHOLD = 8
+SD = np.sqrt(DIM)
+
+PHASES = [
+dict(name=‘easy’,      tasks=40, difficulty=1.0),
+dict(name=‘medium’,    tasks=40, difficulty=1.8),
+dict(name=‘hard’,      tasks=40, difficulty=3.0),
+dict(name=‘very_hard’, tasks=40, difficulty=5.0),
+dict(name=‘extreme’,   tasks=40, difficulty=8.0),
+]
+
+def cosine_distance(a, b):
+na, nb = np.linalg.norm(a), np.linalg.norm(b)
+if na == 0 or nb == 0: return 1.0
+return 1.0 - np.dot(a, b) / (na * nb)
+
+def generate_tasks(rng):
+type_solutions = {}
+for i in range(N_TYPES):
+v = rng.randn(DIM)
+type_solutions[i] = v / np.linalg.norm(v)
+tasks = []
+idx = 0
+for phase in PHASES:
+for _ in range(phase[‘tasks’]):
+tt = idx % N_TYPES
+sol = type_solutions[tt] + rng.randn(DIM) * 0.5 / SD
+sol = sol / np.linalg.norm(sol)
+tasks.append(dict(type=tt, solution=sol,
+difficulty=phase[‘difficulty’], phase=phase[‘name’]))
+idx += 1
+return tasks
+
+def search_for_solution(task, rag_entries, bloat_size, rng):
+“””
+Probabilistic search. Base probability per step = 0.06 / difficulty.
+RAG entries boost probability if they’re close to the solution.
+Bloat penalty degrades retrieval quality when index is too large.
+“””
+solution = task[‘solution’]
+difficulty = task[‘difficulty’]
+base_prob = 0.06
+
+```
+rag_boost = 1.0
+if rag_entries:
+    best = min(rag_entries, key=lambda e: cosine_distance(e['vec'], solution))
+    dist = cosine_distance(best['vec'], solution)
+    if dist < 0.15:
+        rag_boost = 2.0
+    elif dist < 0.3:
+        rag_boost = 1.3
+    if bloat_size > BLOAT_THRESHOLD:
+        rag_boost *= max(0.2, 1.0 - (bloat_size - BLOAT_THRESHOLD) * 0.08)
+
+solve_prob = base_prob * rag_boost / difficulty
+
+for step in range(MAX_STEPS):
+    if rng.random() < solve_prob:
+        strategy = solution + rng.randn(DIM) * 0.5 / SD
+        strategy = strategy / np.linalg.norm(strategy)
+        return True, step + 1, strategy
+
+strategy = rng.randn(DIM)
+strategy = strategy / np.linalg.norm(strategy)
+return False, MAX_STEPS, strategy
+```
+
+def run_regime_a(tasks):
+“”“No L4. Each task isolated.”””
+rng = np.random.RandomState(SEED)
+results = []
+for task in tasks:
+ok, steps, strat = search_for_solution(task, [], 0, rng)
+results.append(dict(success=ok, steps=steps, phase=task[‘phase’], type=task[‘type’]))
+return results, dict(total_writes=0, final_rag=0, blocked=0, pruned=0)
+
+def run_regime_b(tasks):
+“”“L4 without drift prevention. Noisy and cross-contaminated writes.”””
+rng = np.random.RandomState(SEED)
+rag = defaultdict(list)
+results = []
+writes = 0
+
+```
+for i, task in enumerate(tasks):
+    tt = task['type']
+    entries = rag.get(tt, [])
+    ok, steps, strat = search_for_solution(task, entries, len(entries), rng)
+    results.append(dict(success=ok, steps=steps, phase=task['phase'], type=tt))
+
+    if ok:
+        rag[tt].append(dict(vec=strat.copy(), idx=i))
+        writes += 1
+        if rng.random() < 0.4:
+            noisy = strat + rng.randn(DIM) * 3.0 / SD
+            noisy = noisy / np.linalg.norm(noisy)
+            rag[tt].append(dict(vec=noisy, idx=i))
+            writes += 1
+        if rng.random() < 0.2:
+            rag[(tt + 1) % N_TYPES].append(dict(vec=strat.copy(), idx=i))
+            writes += 1
+
+final_rag = sum(len(v) for v in rag.values())
+return results, dict(total_writes=writes, final_rag=final_rag, blocked=0, pruned=0)
+```
+
+def run_regime_c(tasks):
+“”“L4 with full drift prevention: validation gate, diversity audit, pruning.”””
+rng = np.random.RandomState(SEED)
+rag = defaultdict(list)
+pending = defaultdict(list)
+results = []
+writes = 0
+blocked = 0
+pruned = 0
+
+```
+for i, task in enumerate(tasks):
+    tt = task['type']
+    entries = rag.get(tt, [])
+    ok, steps, strat = search_for_solution(task, entries, len(entries), rng)
+    results.append(dict(success=ok, steps=steps, phase=task['phase'], type=tt))
+
+    if ok:
+        matched = False
+        for pw in pending[tt]:
+            if cosine_distance(pw['vec'], strat) < DELTA_NOV:
+                pw['count'] += 1
+                pw['last'] = i
+                matched = True
+                if pw['count'] >= M_VALIDATE and not pw.get('done'):
+                    novel = all(cosine_distance(e['vec'], pw['vec']) >= DELTA_NOV
+                               for e in rag[tt])
+                    if novel:
+                        rag[tt].append(dict(vec=pw['vec'].copy(), idx=i, last=i))
+                        writes += 1
+                    else:
+                        blocked += 1
+                    pw['done'] = True
+                break
+        if not matched:
+            pending[tt].append(dict(vec=strat.copy(), count=1, last=i, done=False))
+            blocked += 1
+
+    if (i + 1) % PRUNE_N == 0:
+        for tt2 in list(rag.keys()):
+            before = len(rag[tt2])
+            rag[tt2] = [e for e in rag[tt2]
+                       if i - e.get('last', e['idx']) < PRUNE_P]
+            pruned += before - len(rag[tt2])
+
+final_rag = sum(len(v) for v in rag.values())
+return results, dict(total_writes=writes, final_rag=final_rag,
+                    blocked=blocked, pruned=pruned)
+```
+
+# === Run ===
+
+tasks = generate_tasks(np.random.RandomState(SEED + 1))
+print(“Running Regime A (No L4)…”)
+res_a, st_a = run_regime_a(tasks)
+print(“Running Regime B (L4, no drift prevention)…”)
+res_b, st_b = run_regime_b(tasks)
+print(“Running Regime C (L4, full drift prevention)…”)
+res_c, st_c = run_regime_c(tasks)
+
+def compute_metrics(res, st):
+succ = sum(1 for r in res if r[‘success’])
+pa = {}
+for pn in [‘easy’, ‘medium’, ‘hard’, ‘very_hard’, ‘extreme’]:
+pr = [r for r in res if r[‘phase’] == pn]
+pa[pn] = sum(1 for r in pr if r[‘success’]) / len(pr) if pr else 0
+return dict(accuracy=succ / len(res), avg_steps=np.mean([r[‘steps’] for r in res]),
+phase_acc=pa, solved=succ, **st)
+
+ma, mb, mc = compute_metrics(res_a, st_a), compute_metrics(res_b, st_b), compute_metrics(res_c, st_c)
+
+# === Table 2 ===
+
+print(”\n” + “=” * 80)
+print(“Table 2. L4 Field Transformation simulation results.”)
+print(”=” * 80)
+print(f”{‘Metric’:<30} {‘Regime A’:>14} {‘Regime B’:>14} {‘Regime C’:>14}”)
+print(”-” * 80)
+
+def fmt(v):
+if isinstance(v, float):
+return f”{v:.3f}” if v < 1 else f”{v:.1f}”
+return str(v)
+
+for label, key in [(‘Overall accuracy’, ‘accuracy’), (‘Avg steps’, ‘avg_steps’),
+(‘Final RAG size’, ‘final_rag’), (‘Total writes’, ‘total_writes’),
+(‘Blocked writes’, ‘blocked’), (‘Pruned entries’, ‘pruned’),
+(‘Cumulative solved’, ‘solved’)]:
+print(f”{label:<30} {fmt(ma[key]):>14} {fmt(mb[key]):>14} {fmt(mc[key]):>14}”)
+
+print(”-” * 80)
+print(“Accuracy by phase:”)
+for pn in [‘easy’, ‘medium’, ‘hard’, ‘very_hard’, ‘extreme’]:
+print(f”  {pn:<28} {ma[‘phase_acc’][pn]:>14.2f} {mb[‘phase_acc’][pn]:>14.2f} {mc[‘phase_acc’][pn]:>14.2f}”)
+print(”=” * 80)
+
+# === Figure 2 ===
+
+fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+fig.suptitle(‘Figure 2. L4 Field Transformation Simulation — Variability Theory Engine’,
+fontsize=14, fontweight=‘bold’, y=0.98)
+clr = {‘A’: ‘#D32F2F’, ‘B’: ‘#FF9800’, ‘C’: ‘#1976D2’}
+lbl = {‘A’: ‘No L4’, ‘B’: ‘L4 (no prevention)’, ‘C’: ‘L4 (drift prevention)’}
+
+def rolling_acc(res, w=20):
+return [sum(1 for r in res[max(0, i-w+1):i+1] if r[‘success’])
+/ len(res[max(0, i-w+1):i+1]) for i in range(len(res))]
+
+ax = axes[0, 0]
+for k, res in [(‘A’, res_a), (‘B’, res_b), (‘C’, res_c)]:
+ax.plot(rolling_acc(res), color=clr[k], linewidth=1.5, label=lbl[k])
+for b in [40, 80, 120, 160]:
+ax.axvline(x=b, color=‘gray’, linestyle=’–’, alpha=0.3)
+ax.set_title(‘Rolling Accuracy (window=20)’, fontweight=‘bold’)
+ax.set_ylabel(‘Accuracy’); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+ax = axes[0, 1]
+w = 10
+for k, res in [(‘A’, res_a), (‘B’, res_b), (‘C’, res_c)]:
+s = [r[‘steps’] for r in res]
+ax.plot(np.convolve(s, np.ones(w)/w, mode=‘valid’), color=clr[k], linewidth=1.5, label=lbl[k])
+ax.set_title(‘Steps to Solution (smoothed)’, fontweight=‘bold’)
+ax.set_ylabel(‘Steps’); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+ax = axes[0, 2]
+ax.bar([‘A’, ‘B’, ‘C’], [st_a[‘final_rag’], st_b[‘final_rag’], st_c[‘final_rag’]],
+color=[clr[‘A’], clr[‘B’], clr[‘C’]])
+ax.set_title(‘Final RAG Index Size’, fontweight=‘bold’)
+ax.set_ylabel(‘Entries’); ax.grid(True, alpha=0.3, axis=‘y’)
+
+ax = axes[1, 0]
+phases = [‘easy’, ‘medium’, ‘hard’, ‘very_hard’, ‘extreme’]
+x = np.arange(len(phases)); w = 0.25
+ax.bar(x - w, [ma[‘phase_acc’][p] for p in phases], w, color=clr[‘A’], label=lbl[‘A’])
+ax.bar(x,     [mb[‘phase_acc’][p] for p in phases], w, color=clr[‘B’], label=lbl[‘B’])
+ax.bar(x + w, [mc[‘phase_acc’][p] for p in phases], w, color=clr[‘C’], label=lbl[‘C’])
+ax.set_title(‘Accuracy by Complexity Phase’, fontweight=‘bold’)
+ax.set_xticks(x); ax.set_xticklabels(phases, rotation=15)
+ax.legend(fontsize=8); ax.grid(True, alpha=0.3, axis=‘y’)
+
+ax = axes[1, 1]
+for k, res in [(‘A’, res_a), (‘B’, res_b), (‘C’, res_c)]:
+ax.plot(np.cumsum([r[‘success’] for r in res]), color=clr[k], linewidth=1.5, label=lbl[k])
+ax.set_title(‘Cumulative Tasks Solved’, fontweight=‘bold’)
+ax.set_ylabel(‘Solved’); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+ax = axes[1, 2]
+x = np.arange(3)
+ax.bar(x,      [st_a[‘total_writes’], st_b[‘total_writes’], st_c[‘total_writes’]], 0.25,
+label=‘Written’, color=’#1976D2’)
+ax.bar(x+0.25, [st_a[‘blocked’], st_b[‘blocked’], st_c[‘blocked’]], 0.25,
+label=‘Blocked’, color=’#FF9800’)
+ax.bar(x+0.5,  [st_a[‘pruned’], st_b[‘pruned’], st_c[‘pruned’]], 0.25,
+label=‘Pruned’, color=’#D32F2F’)
+ax.set_title(‘Write Efficiency’, fontweight=‘bold’)
+ax.set_xticks(x + 0.25); ax.set_xticklabels([‘A’, ‘B’, ‘C’])
+ax.legend(fontsize=8); ax.grid(True, alpha=0.3, axis=‘y’)
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig(‘vt_L4_simulation.png’, dpi=300, bbox_inches=‘tight’)
+plt.close()
+print(f”\nFigure saved: vt_L4_simulation.png”)
+print(“Simulation complete.”)
